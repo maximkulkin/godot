@@ -458,12 +458,15 @@ Error ResourceInteractiveLoaderText::poll() {
 
 		Ref<Resource> res;
 
-		bool do_assign = false;
+		bool do_assign = true;
 
 		if (!no_subresource_cache && ResourceCache::has(path)) {
 			//cached, do not assign
 			Resource *r = ResourceCache::get(path);
 			res = Ref<Resource>(r);
+		} else if (int_resources.has(id)) {
+			//reuse already seen subresource
+			res = int_resources[id];
 		} else {
 			//create
 			Object *obj = ClassDB::instance(type);
@@ -483,7 +486,13 @@ Error ResourceInteractiveLoaderText::poll() {
 			}
 
 			res = Ref<Resource>(r);
-			do_assign = true;
+		}
+
+		if (res->get_class() != type) {
+			error = ERR_FILE_CORRUPT;
+			error_text += "Subresource " + itos(id) + " has type redefined from " + res->get_class() + " to " + type;
+			_printerr();
+			return error;
 		}
 
 		int_resources[id] = res; //always assign int resources
@@ -530,24 +539,6 @@ Error ResourceInteractiveLoaderText::poll() {
 			error = ERR_FILE_CORRUPT;
 			return error;
 		}
-
-		Object *obj = ClassDB::instance(res_type);
-		if (!obj) {
-			error_text += "Can't create sub resource of type: " + res_type;
-			_printerr();
-			error = ERR_FILE_CORRUPT;
-			return error;
-		}
-
-		Resource *r = Object::cast_to<Resource>(obj);
-		if (!r) {
-			error_text += "Can't create sub resource of type, because not a resource: " + res_type;
-			_printerr();
-			error = ERR_FILE_CORRUPT;
-			return error;
-		}
-
-		resource = Ref<Resource>(r);
 
 		resource_current++;
 
@@ -827,6 +818,24 @@ void ResourceInteractiveLoaderText::open(FileAccess *p_f, bool p_skip_first_tag)
 		}
 
 		res_type = tag.fields["type"];
+		Object *obj = ClassDB::instance(res_type);
+		if (!obj) {
+			error_text += "Can't create sub resource of type: " + res_type;
+			_printerr();
+			error = ERR_FILE_CORRUPT;
+			return;
+		}
+
+		Resource *r = Object::cast_to<Resource>(obj);
+		if (!r) {
+			error_text += "Can't create sub resource of type, because not a resource: " + res_type;
+			_printerr();
+			error = ERR_FILE_CORRUPT;
+			return;
+		}
+
+		resource = Ref<Resource>(r);
+		int_resources[0] = resource;
 
 	} else {
 		error_text = "Unrecognized file type: " + tag.name;
@@ -1329,18 +1338,19 @@ void ResourceFormatSaverTextInstance::_find_resources(const Variant &p_variant, 
 			}
 
 			if (!p_main && (!bundle_resources) && res->get_path().length() && res->get_path().find("::") == -1) {
-				if (res->get_path() == local_path) {
-					ERR_PRINT("Circular reference to resource being saved found: '" + local_path + "' will be null next time it's loaded.");
+				if (res->get_path() != local_path) {
+					int index = external_resources.size();
+					external_resources[res] = index;
 					return;
 				}
-				int index = external_resources.size();
-				external_resources[res] = index;
-				return;
 			}
 
 			if (resource_set.has(res)) {
+				forward_declare_resources.insert(res);
 				return;
 			}
+
+			resource_set.insert(res);
 
 			List<PropertyInfo> property_list;
 
@@ -1373,8 +1383,7 @@ void ResourceFormatSaverTextInstance::_find_resources(const Variant &p_variant, 
 				I = I->next();
 			}
 
-			resource_set.insert(res); //saved after, so the children it needs are available when loaded
-			saved_resources.push_back(res);
+			saved_resources.push_back(res); //saved after, so the children it needs are available when loaded
 
 		} break;
 		case Variant::ARRAY: {
@@ -1439,11 +1448,16 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const RES &p_r
 	}
 
 	{
+		// Main resource does not need a separate forward declaration,
+		// it is declared with "gd_resource" tag anyways.
+		// Scene resource is not part of an original tree and can not be referenced.
+		forward_declare_resources.erase(p_resource);
+
 		String title = packed_scene.is_valid() ? "[gd_scene " : "[gd_resource ";
 		if (packed_scene.is_null()) {
 			title += "type=\"" + p_resource->get_class() + "\" ";
 		}
-		int load_steps = saved_resources.size() + external_resources.size();
+		int load_steps = saved_resources.size() + external_resources.size() + forward_declare_resources.size();
 		/*
 		if (packed_scene.is_valid()) {
 			load_steps+=packed_scene->get_node_count();
@@ -1532,6 +1546,39 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const RES &p_r
 		}
 	}
 
+	int next_subindex = 1;
+	// Assign subindexes to resources that dont have them yet
+	for (List<RES>::Element *E = saved_resources.front(); E; E = E->next()) {
+		RES res = E->get();
+		ERR_CONTINUE(!resource_set.has(res));
+		bool main = (E->next() == nullptr);
+
+		if (main) {
+			res->set_subindex(0);
+			continue;
+		}
+
+		if (res->get_subindex() != 0) {
+			continue;
+		}
+
+		while (used_indices.has(next_subindex)) {
+			next_subindex++;
+		}
+
+		res->set_subindex(next_subindex++);
+	}
+
+	internal_resources[p_resource] = 0;
+	// Serialize forward resource declarations first
+	for (Set<RES>::Element *E = forward_declare_resources.front(); E; E = E->next()) {
+		RES res = E->get();
+		f->store_line("[sub_resource type=\"" + res->get_class() + "\" id=" + itos(res->get_subindex()) + "]");
+		f->store_line(String());
+
+		internal_resources[res] = res->get_subindex();
+	}
+
 	for (List<RES>::Element *E = saved_resources.front(); E; E = E->next()) {
 		RES res = E->get();
 		ERR_CONTINUE(!resource_set.has(res));
@@ -1544,20 +1591,8 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const RES &p_r
 		if (main) {
 			f->store_line("[resource]");
 		} else {
-			String line = "[sub_resource ";
-			if (res->get_subindex() == 0) {
-				int new_subindex = 1;
-				if (used_indices.size()) {
-					new_subindex = used_indices.back()->get() + 1;
-				}
-
-				res->set_subindex(new_subindex);
-				used_indices.insert(new_subindex);
-			}
-
 			int idx = res->get_subindex();
-			line += "type=\"" + res->get_class() + "\" id=" + itos(idx);
-			f->store_line(line + "]");
+			f->store_line("[sub_resource type=\"" + res->get_class() + "\" id=" + idx + "]");
 			if (takeover_paths) {
 				res->set_path(p_path + "::" + itos(idx), true);
 			}

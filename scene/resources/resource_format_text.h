@@ -163,6 +163,7 @@ class ResourceFormatSaverTextInstance {
 
 	Set<RES> resource_set;
 	List<RES> saved_resources;
+	Set<RES> forward_declare_resources;
 	Map<RES, int> external_resources;
 	Map<RES, int> internal_resources;
 
